@@ -120,8 +120,14 @@ def _fetch_metadata(rics: list[str]) -> dict:
 
 
 def _parse_date(val):
-    if val is None or (isinstance(val, float) and pd.isna(val)):
-        return None
+    # pd.NaT is (surprisingly) a subclass of datetime.date AND truthy, so it must be
+    # caught by pd.isna() before any isinstance(val, date) check, or a missing
+    # expiry/FND silently passes through as a "valid" date full of NaNs.
+    try:
+        if val is None or pd.isna(val):
+            return None
+    except (TypeError, ValueError):
+        pass  # pd.isna() can't evaluate some types (e.g. arrays) — fall through
     if isinstance(val, date):
         return val
     try:
@@ -209,6 +215,7 @@ def _ingest_direct_market(cfg, prices_df: pd.DataFrame, skipped_df: pd.DataFrame
     new_rows, delete_specs, new_skip_rows = [], [], []
 
     for i, ctr in enumerate(to_process, 1):
+      try:
         ric = ctr['ric']
         if not ric:
             continue
@@ -217,6 +224,11 @@ def _ingest_direct_market(cfg, prices_df: pd.DataFrame, skipped_df: pd.DataFrame
         actual_fnd    = meta.get('fnd')
         if actual_fnd is None and cfg.fnd_fn:
             actual_fnd = cfg.fnd_fn(ctr['month_code'], ctr['year'])
+
+        # Metadata dates can come back as pandas/numpy scalar types (e.g. numpy.float64
+        # if LSEG returns a raw serial number) that datetime.date() rejects outright —
+        # normalize defensively rather than trust the upstream type.
+        actual_expiry = date(int(actual_expiry.year), int(actual_expiry.month), int(actual_expiry.day))
 
         clean_name = ctr['clean_name']
         ctr_last   = contract_last_dates.get(clean_name)
@@ -263,6 +275,9 @@ def _ingest_direct_market(cfg, prices_df: pd.DataFrame, skipped_df: pd.DataFrame
         new_rows.append(out)
         delete_specs.append((clean_name, replace_from))
         log.info("%s — stored %d rows", clean_name, len(out))
+      except Exception:
+        log.exception("%s — unexpected error, skipping this contract", ctr.get('clean_name'))
+        continue
 
     prices_df = _apply_updates(prices_df, ticker, existing, new_rows, delete_specs)
 
@@ -561,10 +576,17 @@ def _compute_flies(spreads_df: pd.DataFrame, cfg) -> pd.DataFrame:
 
 
 # ── main ──────────────────────────────────────────────────────────────────────
-def main(force: bool = False):
+def main(force: bool = False, tickers: list[str] | None = None):
+    """
+    tickers: optional subset of direct-market tickers to fetch (e.g. ['KC', 'CT']).
+             When set, GBP + derived markets (WP/CFARB/COCARB) are skipped — they
+             need their underlying legs fetched too, so run without a filter once
+             all the direct markets they depend on have data.
+    """
     today = date.today()
     log.info("=" * 60)
-    log.info("Seasonal Dashboard ingest — %s (force=%s)", today, force)
+    log.info("Seasonal Dashboard ingest — %s (force=%s, tickers=%s)",
+             today, force, tickers or 'ALL')
     log.info("=" * 60)
 
     DB_DIR.mkdir(parents=True, exist_ok=True)
@@ -580,28 +602,49 @@ def main(force: bool = False):
     if not gbp_df.empty:
         gbp_df['date'] = pd.to_datetime(gbp_df['date'])
 
+    markets_to_fetch = DIRECT_MARKETS if tickers is None else \
+        [m for m in DIRECT_MARKETS if m.ticker in tickers]
+    unknown = set(tickers or []) - {m.ticker for m in DIRECT_MARKETS}
+    if unknown:
+        log.warning("Unknown/non-direct tickers ignored (derived markets aren't fetched "
+                     "directly, run without --tickers to include them): %s", unknown)
+
     ld.open_session()
     try:
-        for cfg in DIRECT_MARKETS:
+        for cfg in markets_to_fetch:
             prices_df, skipped_df = _ingest_direct_market(cfg, prices_df, skipped_df, today, force=force)
 
-        gbp_df = _ingest_gbp(gbp_df, today, force=force)
-
-        prices_df = _ingest_wp(prices_df, force=force)
-        prices_df = _ingest_cfarb(prices_df, force=force)
-        prices_df = _ingest_cocarb(prices_df, gbp_df, force=force)
+        if tickers is None:
+            gbp_df = _ingest_gbp(gbp_df, today, force=force)
+            prices_df = _ingest_wp(prices_df, force=force)
+            prices_df = _ingest_cfarb(prices_df, force=force)
+            prices_df = _ingest_cocarb(prices_df, gbp_df, force=force)
     finally:
         ld.close_session()
 
-    log.info("Computing spreads and flies for all %d markets...", len(ALL_MARKETS))
+    markets_for_spreads = ALL_MARKETS if tickers is None else markets_to_fetch
+    log.info("Computing spreads and flies for %d market(s)...", len(markets_for_spreads))
     spread_frames, fly_frames = [], []
-    for cfg in ALL_MARKETS:
+    for cfg in markets_for_spreads:
         sp = _compute_spreads(prices_df, cfg)
         spread_frames.append(sp)
         fly_frames.append(_compute_flies(sp, cfg))
 
-    spreads_df = pd.concat(spread_frames, ignore_index=True) if spread_frames else pd.DataFrame(columns=SPREADS_COLS)
-    flies_df   = pd.concat(fly_frames, ignore_index=True) if fly_frames else pd.DataFrame(columns=FLIES_COLS)
+    new_spreads_df = pd.concat(spread_frames, ignore_index=True) if spread_frames else pd.DataFrame(columns=SPREADS_COLS)
+    new_flies_df   = pd.concat(fly_frames, ignore_index=True) if fly_frames else pd.DataFrame(columns=FLIES_COLS)
+
+    # Partial runs (tickers filter) must not clobber other markets' already-saved
+    # spreads/flies — carry forward whatever's on disk for tickers not touched this run.
+    touched = {cfg.ticker for cfg in markets_for_spreads}
+    old_spreads_df = _load(SPREADS_PARQUET, SPREADS_COLS)
+    old_flies_df   = _load(FLIES_PARQUET, FLIES_COLS)
+    kept_spreads   = old_spreads_df[~old_spreads_df['ticker'].isin(touched)] if not old_spreads_df.empty else old_spreads_df
+    kept_flies     = old_flies_df[~old_flies_df['ticker'].isin(touched)] if not old_flies_df.empty else old_flies_df
+
+    spreads_parts = [d for d in (kept_spreads, new_spreads_df) if not d.empty]
+    flies_parts   = [d for d in (kept_flies, new_flies_df) if not d.empty]
+    spreads_df = pd.concat(spreads_parts, ignore_index=True) if spreads_parts else pd.DataFrame(columns=SPREADS_COLS)
+    flies_df   = pd.concat(flies_parts, ignore_index=True) if flies_parts else pd.DataFrame(columns=FLIES_COLS)
 
     prices_df  = prices_df.sort_values(['ticker', 'contract_name', 'date']).reset_index(drop=True)
     spreads_df = spreads_df.sort_values(['ticker', 'vintage', 'date']).reset_index(drop=True)
@@ -621,5 +664,12 @@ def main(force: bool = False):
             log.info("  %-8s %s", t, d.date())
 
 
+def _parse_tickers_arg() -> list[str] | None:
+    for arg in sys.argv[1:]:
+        if arg.startswith('--tickers='):
+            return [t.strip().upper() for t in arg.split('=', 1)[1].split(',') if t.strip()]
+    return None
+
+
 if __name__ == '__main__':
-    main(force='--force' in sys.argv)
+    main(force='--force' in sys.argv, tickers=_parse_tickers_arg())
